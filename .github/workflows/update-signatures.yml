@@ -1,0 +1,95 @@
+name: Update signed ClamAV mirror
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '23 */6 * * *'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: clamav-mirror
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      # No checkout, PAT, Portainer key or VirusTotal key is needed.
+      - name: Restore previous signed databases and updater state
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p database "$HOME/.cvdupdate" "$RUNNER_TEMP/clamav-state"
+          if gh release view --json tagName > "$RUNNER_TEMP/latest.json" 2>/dev/null; then
+            previous=$(jq -r .tagName "$RUNNER_TEMP/latest.json")
+            [[ "$previous" == mirror-* ]] || { echo 'Use a dedicated mirror repository.'; exit 1; }
+            gh release download "$previous" --pattern '*.cvd' --dir database
+            gh release download "$previous" --pattern updater-state.json --dir "$RUNNER_TEMP/clamav-state"
+            cp "$RUNNER_TEMP/clamav-state/updater-state.json" "$HOME/.cvdupdate/state.json"
+          fi
+
+      - name: Update using Cisco Talos cvdupdate
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m venv "$RUNNER_TEMP/cvd-venv"
+          "$RUNNER_TEMP/cvd-venv/bin/python" -m pip install 'cvdupdate>=1.2,<2'
+          "$RUNNER_TEMP/cvd-venv/bin/cvd" config set --dbs-directory "$PWD/database"
+          "$RUNNER_TEMP/cvd-venv/bin/cvd" update
+          cp "$HOME/.cvdupdate/state.json" updater-state.json
+
+      - name: Verify official signatures and definition freshness
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker pull clamav/clamav:1.4.6_base
+          for db in main daily bytecode; do
+            test -s "database/$db.cvd"
+            docker run --rm --network none --entrypoint sigtool \
+              -v "$PWD/database:/data:ro" clamav/clamav:1.4.6_base --info "/data/$db.cvd"
+          done
+          python3 - <<'PY'
+          import hashlib, json, time
+          from pathlib import Path
+          manifest = {'generated_at': int(time.time()), 'databases': {}}
+          for name in ('main', 'daily', 'bytecode'):
+              path = Path('database') / (name + '.cvd')
+              with path.open('rb') as file:
+                  header = file.read(512).rstrip(b' \t\r\n\0')
+              if not header.startswith(b'ClamAV-VDB:'):
+                  raise SystemExit('Invalid CVD header')
+              fields = header.decode('ascii').split(':')
+              built = int(fields[-1])
+              if name == 'daily' and not -3600 <= time.time() - built <= 48 * 3600:
+                  raise SystemExit('Daily database is stale or future-dated; keeping last good release')
+              with path.open('rb') as file:
+                  digest = hashlib.file_digest(file, 'sha256').hexdigest()
+              manifest['databases'][name] = {'bytes':path.stat().st_size, 'sha256':digest,
+                                            'built_at':built, 'version':int(fields[2])}
+          Path('manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
+          PY
+
+      - name: Publish complete snapshot atomically
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="mirror-$(date -u +%Y%m%dT%H%M%SZ)-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          gh release create "$tag" --draft --target "$GITHUB_SHA" \
+            --title "ClamAV signatures $tag" \
+            --notes 'Official signed ClamAV CVD databases, mirrored with cvdupdate. See manifest.json for build times and SHA-256 hashes.' \
+            database/main.cvd database/daily.cvd database/bytecode.cvd manifest.json updater-state.json
+          gh release edit "$tag" --draft=false --latest
+
+      - name: Keep the latest three complete snapshots
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh api "repos/$GH_REPO/releases?per_page=100" \
+            --jq '[.[] | select(.draft == false and (.tag_name | startswith("mirror-")))] | .[3:][] | .tag_name' \
+            | while IFS= read -r tag; do gh release delete "$tag" --cleanup-tag --yes; done
