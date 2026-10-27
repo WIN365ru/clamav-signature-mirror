@@ -39,8 +39,8 @@ jobs:
         run: |
           set -euo pipefail
           python3 -m venv "$RUNNER_TEMP/cvd-venv"
-          "$RUNNER_TEMP/cvd-venv/bin/python" -m pip install 'cvdupdate>=1.2,<2'
-          "$RUNNER_TEMP/cvd-venv/bin/cvd" config set --dbs-directory "$PWD/database"
+          "$RUNNER_TEMP/cvd-venv/bin/python" -m pip install 'cvdupdate==1.2.0'
+          "$RUNNER_TEMP/cvd-venv/bin/cvd" config set --dbdir "$PWD/database"
           "$RUNNER_TEMP/cvd-venv/bin/cvd" update
           cp "$HOME/.cvdupdate/state.json" updater-state.json
 
